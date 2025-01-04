@@ -1,1 +1,3 @@
 # Plugin_HTTPAPICreateWav
+このPluginは、HTTP APIを利用して、Wavファイルを作成するためのPluginです。
+主にYMM4-MoreBOUYOMIPlugin用ですが、HTTPを経由して他の人も使えるようになってます。
