@@ -13,9 +13,7 @@ using FNF.Controls;
 using FNF.XmlSerializerSetting;
 using FNF.BouyomiChanApp;
 using System.Net;
-using System.Security.Cryptography;
 using System.Collections.Specialized;
-using FNF.JsonParser;
 
 namespace Plugin_HTTPAPICreateWav {
     public class Plugin_HTTPAPICreateWav : IPlugin {
@@ -131,6 +129,21 @@ namespace Plugin_HTTPAPICreateWav {
                     responseString = $"text={text}, speed={speed}, volume={volume}, voice={voice}, tone={tone}";
                     AddTalkTask(text, speed, volume, (VoiceType)voice, tone, filename);
                 }
+                if (path == "/speakraw")
+                {
+                    // /speakraw の場合の処理
+                    string query = request.RawUrl;
+                    NameValueCollection queryParams = HttpUtilityEx.ParseQuery(query, true);
+
+                    string text = queryParams["text"];
+                    string filename = queryParams["filename"];
+                    int speed = int.Parse(queryParams["speed"] ?? "-1");
+                    int volume = int.Parse(queryParams["volume"] ?? "-1");
+                    int voice = int.Parse(queryParams["voice"] ?? "0");
+                    int tone = int.Parse(queryParams["tone"] ?? "100");
+                    responseString = $"text={text}, speed={speed}, volume={volume}, voice={voice}, tone={tone}";
+                    AddTalkRawTask(text, speed, volume, (VoiceType)voice, tone, filename);
+                }
                 else
                 {
                     // その他のパスの場合の処理
@@ -164,8 +177,29 @@ namespace Plugin_HTTPAPICreateWav {
 
             while (Pub.TalkTaskCount > 0 && waited < timeout)
             {
-                Thread.Sleep(5);
-                waited += 5;
+                Thread.Sleep(3);
+                waited += 3;
+            }
+
+            if (Pub.TalkTaskCount > 0)
+            {
+                // タイムアウト処理
+                throw new TimeoutException("Talk task did not complete within the expected time.");
+            }
+        }
+        //生
+        private void AddTalkRawTask(string text, int speed, int volume, VoiceType voice, int tone, string filename)
+        {
+            Pub.AddTalkTask(text, speed, tone, volume, voice, filename);
+
+            // タイムアウトを設定（例: 10秒）
+            int timeout = 10000;
+            int waited = 0;
+
+            while (Pub.TalkTaskCount > 0 && waited < timeout)
+            {
+                Thread.Sleep(3);
+                waited += 3;
             }
 
             if (Pub.TalkTaskCount > 0)
