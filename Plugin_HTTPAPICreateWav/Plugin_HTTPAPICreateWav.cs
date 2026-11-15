@@ -2,34 +2,30 @@ using System;
 using System.IO;
 using System.Text;
 using System.Threading;
+using System.Diagnostics;
 using System.ComponentModel;
-using System.Windows.Forms;
 using System.Runtime.InteropServices;
+using System.Net;
+using System.Collections.Specialized;
+using System.Collections.Generic;
+using FNF.JsonParser;
 using FNF.Utility;
 using FNF.XmlSerializerSetting;
 using FNF.BouyomiChanApp;
-using System.Net;
-using System.Collections.Specialized;
 
 namespace Plugin_HTTPAPICreateWav
 {
-
     public class Plugin_HTTPAPICreateWav : IPlugin
     {
-        #region ¡ƒtƒB[ƒ‹ƒh
-
         private Settings_HTTPAPICreateWav _Settings;
         private SettingFormData_HTTPAPICreateWav _SettingFormData;
         private string _SettingFile = Base.CallAsmPath + Base.CallAsmName + ".setting";
         private HttpListener _Server;
+        private volatile bool _Stopping;
 
-        #endregion
-
-        #region ¡IPluginƒƒ“ƒo‚ÌÀ‘•
-
-        public string Name { get { return "HTTP wave•Û‘¶"; } }
-        public string Version { get { return "1.0.0"; } }
-        public string Caption { get { return "HTTP‚ğg‚Á‚Ä‚¢‚¢Š´‚¶‚Éwavƒtƒ@ƒCƒ‹‚ğì‚Á‚Ä•Û‘¶‚µ‚Ü‚·B"; } }
+        public string Name { get { return "HTTP waveä¿å­˜"; } }
+        public string Version { get { return "1.2.0"; } }
+        public string Caption { get { return "HTTPã‚’ä½¿ã£ã¦ã„ã„æ„Ÿã˜ã«wavãƒ•ã‚¡ã‚¤ãƒ«ã‚’ä½œã£ã¦ä¿å­˜ã—ã¾ã™ã€‚"; } }
         public ISettingFormData SettingFormData { get { return _SettingFormData; } }
 
         public void Begin()
@@ -37,47 +33,41 @@ namespace Plugin_HTTPAPICreateWav
             _Settings = new Settings_HTTPAPICreateWav(this);
             _Settings.Load(_SettingFile);
             _SettingFormData = new SettingFormData_HTTPAPICreateWav(_Settings);
+            if (_Settings.Port < 1 || _Settings.Port > 65535)
+                throw new ArgumentOutOfRangeException("Port", "ãƒãƒ¼ãƒˆã¯1ã€œ65535ã§æŒ‡å®šã—ã¦ãã ã•ã„ã€‚");
 
+            _Stopping = false;
             _Server = new HttpListener();
-            if (_Settings.Port > 0)
-                _Server.Prefixes.Add(string.Format("http://{0}:{1}/", "localhost", _Settings.Port));
+            _Server.Prefixes.Add(string.Format("http://localhost:{0}/", _Settings.Port));
             _Server.Start();
-            _Server.BeginGetContext(new AsyncCallback(this.HttpListenerCallback), _Server);
+            _Server.BeginGetContext(HttpListenerCallback, _Server);
         }
 
         public void End()
         {
-            _Settings.Save(_SettingFile);
-
+            _Stopping = true;
             if (_Server != null)
             {
-                _Server.Stop();
                 _Server.Close();
                 _Server = null;
             }
+            if (_Settings != null)
+                _Settings.Save(_SettingFile);
         }
-
-        #endregion
-
-        #region ¡HTTPƒŠƒNƒGƒXƒgˆ—
 
         private void HttpListenerCallback(IAsyncResult result)
         {
-            if (_Server == null || !_Server.IsListening) return;
-
+            HttpListener server = (HttpListener)result.AsyncState;
             HttpListenerContext context = null;
             try
             {
-                context = _Server.EndGetContext(result);
-                _Server.BeginGetContext(new AsyncCallback(HttpListenerCallback), _Server);
-            }
-            catch (ObjectDisposedException)
-            {
-                return;
+                context = server.EndGetContext(result);
+                server.BeginGetContext(HttpListenerCallback, server);
             }
             catch (Exception ex)
             {
-                Console.WriteLine("HTTPƒRƒ“ƒeƒLƒXƒgæ“¾’†‚ÉƒGƒ‰[: " + ex.Message);
+                if (context != null) context.Response.Close();
+                if (!_Stopping) Console.WriteLine("HTTPå—ä»˜ã‚¨ãƒ©ãƒ¼: " + ex.Message);
                 return;
             }
 
@@ -86,191 +76,245 @@ namespace Plugin_HTTPAPICreateWav
                 HttpListenerRequest request = context.Request;
                 HttpListenerResponse response = context.Response;
                 string path = request.Url.AbsolutePath;
-
-                string responseString = "OK";
-
-                if (path == "/speak" || path == "/speakraw")
+                if (path != "/speak" && path != "/speakraw" && path != "/getvoicelist")
                 {
-                    NameValueCollection queryParams = HttpUtilityEx.ParseQuery(request.RawUrl, true);
+                    WriteResponse(response, 404, "Not Found");
+                    return;
+                }
+                // X-API-Passwordã‚’ãƒ–ãƒ©ã‚¦ã‚¶ãƒ¼ã‹ã‚‰é€ã‚‹å ´åˆã®ãƒ—ãƒªãƒ•ãƒ©ã‚¤ãƒˆã€‚
+                if (request.HttpMethod == "OPTIONS")
+                {
+                    response.Headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS";
+                    response.Headers["Access-Control-Allow-Headers"] = "X-API-Password, Content-Type";
+                    WriteResponse(response, 204, "");
+                    return;
+                }
+                if (request.HttpMethod != "GET" && request.HttpMethod != "POST")
+                {
+                    response.Headers["Allow"] = "GET, POST, OPTIONS";
+                    WriteResponse(response, 405, "Use GET or POST.");
+                    return;
+                }
 
-                    string text = queryParams["text"];
-                    string filename = queryParams["filename"];
-                    int speed = int.Parse(queryParams["speed"] ?? "-1");
-                    int volume = int.Parse(queryParams["volume"] ?? "-1");
-                    int voice = int.Parse(queryParams["voice"] ?? "0");
-                    int tone = int.Parse(queryParams["tone"] ?? "100");
+                NameValueCollection query = HttpUtilityEx.ParseQuery(request.RawUrl, true);
+                string password = request.Headers["X-API-Password"] ?? query["password"];
+                if (!string.IsNullOrEmpty(_Settings.Password) && _Settings.Password != password)
+                {
+                    WriteResponse(response, 401, "Invalid password.");
+                    return;
+                }
 
-                    responseString = string.Format(
-                        "text={0}, speed={1}, volume={2}, voice={3}, tone={4}",
-                        text, speed, volume, voice, tone);
+                if (path == "/getvoicelist")
+                {
+                    WriteResponse(response, 200, CreateVoiceListJson(Pub.FormMain.BC.Voices), "application/json");
+                    return;
+                }
 
-                    if (path == "/speak")
-                        AddTalkTask(text, speed, volume, (FNF.Utility.VoiceType)voice, tone, filename);
-                    else
-                        AddTalkRawTask(text, speed, volume, (FNF.Utility.VoiceType)voice, tone, filename);
+                string text = query["text"];
+                string filename = query["filename"];
+                if (string.IsNullOrEmpty(text) || text.Trim().Length == 0 || text.IndexOf('\0') >= 0)
+                    throw new ArgumentException("textã‚’æŒ‡å®šã—ã¦ãã ã•ã„ï¼ˆç©ºç™½ã®ã¿ãƒ»NULæ–‡å­—ã¯ä¸å¯ï¼‰ã€‚");
+                if (string.IsNullOrEmpty(filename) || filename.Trim().Length == 0)
+                    throw new ArgumentException("filenameã‚’æŒ‡å®šã—ã¦ãã ã•ã„ã€‚");
+                filename = Path.GetFullPath(filename);
+                if (Path.GetFileName(filename).IndexOfAny(Path.GetInvalidFileNameChars()) >= 0
+                    || !string.Equals(Path.GetExtension(filename), ".wav", StringComparison.OrdinalIgnoreCase)
+                    || !Directory.Exists(Path.GetDirectoryName(filename)))
+                    throw new ArgumentException("filenameã«ã¯å­˜åœ¨ã™ã‚‹ãƒ•ã‚©ãƒ«ãƒ€ãƒ¼å†…ã®.wavãƒ•ã‚¡ã‚¤ãƒ«ã‚’æŒ‡å®šã—ã¦ãã ã•ã„ã€‚");
+
+                int speed = ReadNumber(query, "speed", -1, 50, 300);
+                int volume = ReadNumber(query, "volume", -1, 0, 300);
+                int tone = ReadNumber(query, "tone", 100, 50, 200);
+                int voiceId = ReadNumber(query, "voice", 0, 0, int.MaxValue);
+                if (voiceId < 0) throw new ArgumentException("voiceã¯0ä»¥ä¸Šã§æŒ‡å®šã—ã¦ãã ã•ã„ã€‚");
+                var bc = Pub.FormMain.BC;
+                VoiceType voice = (VoiceType)voiceId;
+                // æœ¬ä½“ã¨åŒã˜æ—§IDäº’æ›å¤‰æ›ã€‚å­˜åœ¨ã—ãªã„å£°ã¸ã®æš—é»™ãƒ•ã‚©ãƒ¼ãƒ«ãƒãƒƒã‚¯ã¯ã—ãªã„ã€‚
+                if (!bc.Voices.ContainsKey(voice))
+                {
+                    if (voiceId >= 9 && voiceId <= 999) voice = (VoiceType)(10001 + voiceId - 9);
+                    else if (voiceId >= 1001 && voiceId <= 1008) voice = (VoiceType)(voiceId - 1000);
+                }
+                if (!bc.Voices.ContainsKey(voice))
+                    throw new ArgumentException("æŒ‡å®šã•ã‚ŒãŸvoiceã¯åˆ©ç”¨ã§ãã¾ã›ã‚“ã€‚");
+
+                bool raw = path == "/speakraw";
+                if (raw)
+                {
+                    if (!(bc.Voices[voice] is BouyomiChan.AquesTalkVoiceBase))
+                        throw new ArgumentException("speakrawã¯AquesTalkç³»ã®voiceã®ã¿å¯¾å¿œã—ã¦ã„ã¾ã™ã€‚");
+                    if ((volume != -1 && volume != 100) || (tone != -1 && tone != 100))
+                        throw new ArgumentException("speakrawã§ã¯volume/toneã¯å¤‰æ›´ã§ãã¾ã›ã‚“ã€‚çœç•¥ã¾ãŸã¯-1/100ã‚’æŒ‡å®šã—ã¦ãã ã•ã„ã€‚");
+                    speed = speed == -1 ? Math.Max(50, Math.Min(300, bc.Speed)) : speed;
+                    AddTalkRawTask(text, speed, voice, filename);
                 }
                 else
                 {
-                    responseString = "Not Found";
-                    response.StatusCode = 404;
+                    AddTalkTask(text, speed, volume, voice, tone, filename);
                 }
-
-                response.ContentType = "text/plain";
-                response.ContentEncoding = Encoding.UTF8;
-                response.Headers.Add("Access-Control-Allow-Origin", "*");
-
-                byte[] buffer = Encoding.UTF8.GetBytes(responseString);
-                response.ContentLength64 = buffer.Length;
-                response.OutputStream.Write(buffer, 0, buffer.Length);
-                response.OutputStream.Close();
+                string message = string.Format("text={0}, speed={1}, volume={2}, voice={3}, tone={4}",
+                    text, speed, volume, (int)voice, tone);
+                if (raw) message += ", raw=true, volume/tone=not_applied";
+                WriteResponse(response, 200, message);
             }
+            catch (ArgumentException ex) { TryWriteError(context.Response, 400, ex.Message); }
+            catch (NotSupportedException ex) { TryWriteError(context.Response, 400, ex.Message); }
+            catch (PathTooLongException ex) { TryWriteError(context.Response, 400, ex.Message); }
+            catch (TimeoutException ex) { TryWriteError(context.Response, 504, ex.Message); }
             catch (Exception ex)
             {
-                Console.WriteLine("HTTPƒŒƒXƒ|ƒ“ƒXˆ—’†‚ÉƒGƒ‰[: " + ex.Message);
-                try
-                {
-                    if (context != null)
-                    {
-                        context.Response.StatusCode = 500;
-                        byte[] buffer = Encoding.UTF8.GetBytes("Error: " + ex.Message);
-                        context.Response.ContentLength64 = buffer.Length;
-                        context.Response.OutputStream.Write(buffer, 0, buffer.Length);
-                        context.Response.OutputStream.Close();
-                    }
-                }
-                catch { }
+                Console.WriteLine("HTTPéŸ³å£°ç”Ÿæˆã‚¨ãƒ©ãƒ¼: " + ex);
+                TryWriteError(context.Response, 500, "éŸ³å£°ç”Ÿæˆã¾ãŸã¯ãƒ•ã‚¡ã‚¤ãƒ«ä¿å­˜ã«å¤±æ•—ã—ã¾ã—ãŸã€‚");
             }
+            finally { context.Response.Close(); }
         }
 
-        #endregion
-
-        #region ¡”­˜bƒ^ƒXƒN
-
-        // –_“Ç‚İ‚¿‚á‚ñ‚Ì•ÏŠ·ƒpƒCƒvƒ‰ƒCƒ“‚ğ’Ê‚·iŠ¿š¨“Ç‚İ‰¼–¼•ÏŠ·‚ ‚èj
-        private void AddTalkTask(string text, int speed, int volume, FNF.Utility.VoiceType voice, int tone, string filename)
+        // æœ¬ä½“ã®HTTPã‚µãƒ¼ãƒãƒ¼ã‚’æœ‰åŠ¹ã«ã—ãªãã¦ã‚‚ã€WAVç”Ÿæˆã¨åŒã˜æ¥ç¶šå…ˆã§è©±è€…ã‚’å–å¾—ã§ãã‚‹ã€‚
+        private static string CreateVoiceListJson(IDictionary<VoiceType, BouyomiChan.IVoice> voices)
         {
-            Pub.AddTalkTask(text, speed, tone, volume, voice, filename);
-            WaitForTaskCompletion();
+            var sortedVoices = new List<KeyValuePair<VoiceType, BouyomiChan.IVoice>>(voices);
+            sortedVoices.Sort((a, b) => a.Key.CompareTo(b.Key));
+            var voiceList = new JsonArray();
+            foreach (var entry in sortedVoices)
+            {
+                // ID 0ã¯æœ¬ä½“ã§é¸æŠä¸­ã®å£°ã®åˆ¥åãªã®ã§ã€ä¸€è¦§ã«ã¯å«ã‚ãªã„ã€‚
+                if (entry.Key == VoiceType.Default) continue;
+                var voice = entry.Value;
+                string kind;
+                if (voice is BouyomiChan.VoiceSAPI50) kind = "SAPI5";
+                else if (voice is BouyomiChan.VoiceSPPF) kind = "Speech Platform";
+                else if (voice is BouyomiChan.AquesTalkFX) kind = "AquesTalkFX";
+                else if (voice is BouyomiChan.AquesTalk2) kind = "AquesTalk2";
+                else if (voice is BouyomiChan.AquesTalkVoiceBase) kind = "AquesTalk";
+                else kind = "Unknown";
+
+                var item = new JsonObject();
+                item.Add("id", new JsonNumber((int)entry.Key));
+                item.Add("kind", new JsonString(kind));
+                item.Add("name", new JsonString(voice.Name ?? string.Empty));
+                item.Add("alias", new JsonString(voice.Data.Alias ?? string.Empty));
+                voiceList.ArrayEx.Add(item);
+            }
+            var result = new JsonObject();
+            result.Add("voiceList", voiceList);
+            return result.ToString();
         }
 
-        // •ÏŠ·ƒpƒCƒvƒ‰ƒCƒ“‚ğŠ®‘SƒoƒCƒpƒXiAquesTalk‹L–@‚ğ‚»‚Ì‚Ü‚Ü“n‚·j
-        //
-        // AquesTalkVoiceBase.CreateWavData() ‚ğ’¼ÚŒÄ‚Ño‚·B
-        // •¶ß•ª‰ğEŠ¿š•ÏŠ·‚È‚Ç‘S‚Ä‚Ì‘Oˆ—‚ğ’Ê‚³‚¸ADLL‚Ì¶o—Í‚ğ‚»‚Ì‚Ü‚Ü•Û‘¶‚·‚éB
-        //
-        // text‚É‚ÍAquesTalk‹L–@‚ğ“n‚·B—á:
-        //   AquesTalk1Œn ¨ "ko'nnichiwa"
-        //   AquesTalk2Œn ¨ "ƒRƒ“ƒjƒ`ƒ" ‚Ü‚½‚Í phoneme‹L–@
-        private void AddTalkRawTask(string text, int speed, int volume, FNF.Utility.VoiceType voice, int tone, string filename)
+        private static int ReadNumber(NameValueCollection query, string name, int defaultValue, int min, int max)
         {
-            var bc = Pub.FormMain.BC;
+            if (query[name] == null) return defaultValue;
+            int value;
+            if (!int.TryParse(query[name], out value) || (value != -1 && (value < min || value > max)))
+                throw new ArgumentException(string.Format("{0}ã¯{1}ã€œ{2}ã®æ•´æ•°ã¾ãŸã¯-1ã§æŒ‡å®šã—ã¦ãã ã•ã„ã€‚", name, min, max));
+            return value;
+        }
 
-            // AquesTalkŒnˆÈŠOiSAPI5, SPPFj‚ÍƒoƒCƒpƒX•s‰Â‚Ì‚½‚ßƒtƒH[ƒ‹ƒoƒbƒN
-            if (!bc.Voices.ContainsKey(voice) || !(bc.Voices[voice] is BouyomiChan.AquesTalkVoiceBase))
-            {
-                Console.WriteLine(string.Format(
-                    "[speakraw] voice={0} ‚ÍAquesTalkŒn‚Å‚È‚¢‚½‚ßƒtƒH[ƒ‹ƒoƒbƒN‚µ‚Ü‚·i•ÏŠ·ƒpƒCƒvƒ‰ƒCƒ“‚ª‘–‚è‚Ü‚·j", voice));
-                AddTalkTask(text, speed, volume, voice, tone, filename);
-                return;
-            }
+        private static void WriteResponse(HttpListenerResponse response, int status, string message, string contentType = "text/plain")
+        {
+            response.StatusCode = status;
+            response.ContentType = contentType + "; charset=utf-8";
+            response.ContentEncoding = Encoding.UTF8;
+            response.Headers["Access-Control-Allow-Origin"] = "*";
+            response.Headers["Cache-Control"] = "no-store";
+            byte[] buffer = Encoding.UTF8.GetBytes(message);
+            response.ContentLength64 = buffer.Length;
+            response.OutputStream.Write(buffer, 0, buffer.Length);
+        }
 
-            var voiceObj = (BouyomiChan.AquesTalkVoiceBase)bc.Voices[voice];
+        private static void TryWriteError(HttpListenerResponse response, int status, string message)
+        {
+            try { WriteResponse(response, status, "Error: " + message); }
+            catch { /* åˆ‡æ–­æ¸ˆã¿ã®ã‚¯ãƒ©ã‚¤ã‚¢ãƒ³ãƒˆã«ã¯å¿œç­”ã§ããªã„ */ }
+        }
 
-            // speed=-1 ‚Ì‚Æ‚«‚Í–_“Ç‚İ‚¿‚á‚ñ‚ÌƒfƒtƒHƒ‹ƒg’l‚ğg‚¤
-            int actualSpeed = (speed == -1) ? 100 : speed;
-
-            int size;
-            IntPtr wavPtr = voiceObj.CreateWavData(text, actualSpeed, out size);
-
-            if (wavPtr == IntPtr.Zero || size <= 0)
-            {
-                throw new InvalidOperationException(string.Format(
-                    "[speakraw] AquesTalk‰¹º‡¬‚É¸”s‚µ‚Ü‚µ‚½ (ptr={0}, size={1}, text={2})", wavPtr, size, text));
-            }
-
+        // Beta21ã¯ä¿å­˜å®Œäº†æ™‚ã«.wav.tmpã‚’.wavã¸ãƒªãƒãƒ¼ãƒ ã™ã‚‹ã®ã§ã€å›ºæœ‰ãƒ‘ã‚¹ã§ãã‚Œã‚’å¾…ã¤ã€‚
+        private void AddTalkTask(string text, int speed, int volume, VoiceType voice, int tone, string filename)
+        {
+            string stagingFile = Path.Combine(Path.GetDirectoryName(filename), ".httpwav-" + Guid.NewGuid().ToString("N") + ".wav");
             try
             {
-                if (!string.IsNullOrEmpty(filename))
+                if (Pub.AddTalkTask(text, speed, tone, volume, voice, stagingFile) < 0)
+                    throw new InvalidOperationException("æ£’èª­ã¿ã¡ã‚ƒã‚“ãŒã‚¿ã‚¹ã‚¯ã‚’å—ã‘ä»˜ã‘ã¾ã›ã‚“ã§ã—ãŸã€‚");
+                Stopwatch timer = Stopwatch.StartNew();
+                while (!File.Exists(stagingFile))
                 {
-                    // CreateWavData ‚ª•Ô‚·ƒ|ƒCƒ“ƒ^‚ÍŠ®‘S‚ÈWAVƒtƒ@ƒCƒ‹iRIFFƒwƒbƒ_[‚İj
-                    // ConvertToWavDataAquesTalk ‚Æˆá‚¢ƒwƒbƒ_[‚ğ”‚ª‚³‚¸‘SƒoƒCƒg‚»‚Ì‚Ü‚Ü•Û‘¶‚·‚é
-                    byte[] wavData = new byte[size];
-                    Marshal.Copy(wavPtr, wavData, 0, size);
-                    File.WriteAllBytes(filename, wavData);
-                    Console.WriteLine(string.Format("[speakraw] •Û‘¶Š®—¹: {0} ({1} bytes)", filename, wavData.Length));
+                    if (_Stopping) throw new InvalidOperationException("ãƒ—ãƒ©ã‚°ã‚¤ãƒ³ã‚’åœæ­¢ã—ã¾ã—ãŸã€‚");
+                    if (timer.ElapsedMilliseconds >= 30000)
+                        throw new TimeoutException("WAVä¿å­˜ãŒ30ç§’ä»¥å†…ã«å®Œäº†ã—ã¾ã›ã‚“ã§ã—ãŸã€‚");
+                    Thread.Sleep(20);
                 }
+                if (_Stopping) throw new InvalidOperationException("ãƒ—ãƒ©ã‚°ã‚¤ãƒ³ã‚’åœæ­¢ã—ã¾ã—ãŸã€‚");
+                if (new FileInfo(stagingFile).Length <= 44)
+                    throw new InvalidOperationException("ç”Ÿæˆã•ã‚ŒãŸWAVã«éŸ³å£°ãƒ‡ãƒ¼ã‚¿ãŒã‚ã‚Šã¾ã›ã‚“ã€‚");
+                File.Copy(stagingFile, filename, true);
             }
             finally
             {
-                // •K‚¸ƒAƒ“ƒ}ƒl[ƒWƒhƒƒ‚ƒŠ‚ğ‰ğ•ú‚·‚é
-                voiceObj.FreeWavData(wavPtr);
+                // ã‚¿ã‚¤ãƒ ã‚¢ã‚¦ãƒˆã—ã¦ã‚‚æŒ‡å®šå…ˆã«ã¯å…¬é–‹ã—ãªã„ã€‚å‡¦ç†ä¸­ã®ä¸€æ™‚ãƒ•ã‚¡ã‚¤ãƒ«ã¯æ®‹ã‚‹å ´åˆãŒã‚ã‚‹ã€‚
+                try { File.Delete(stagingFile); File.Delete(stagingFile + ".tmp"); }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
             }
         }
 
-        private void WaitForTaskCompletion()
+        // å¤‰æ›ãƒ»éŸ³é‡/éŸ³ç¨‹èª¿æ•´ã‚’é€šã•ãšã€ã‚¨ãƒ³ã‚¸ãƒ³ã®ç”ŸWAVã‚’ä¿å­˜ã™ã‚‹ã€‚
+        private void AddTalkRawTask(string text, int speed, VoiceType voice, string filename)
         {
-            const int timeout = 10000;
-            int waited = 0;
-            while (Pub.TalkTaskCount > 0 && waited < timeout)
+            var voiceObj = (BouyomiChan.AquesTalkVoiceBase)Pub.FormMain.BC.Voices[voice];
+            int size;
+            IntPtr wavPtr = voiceObj.CreateWavData(text, speed, out size);
+            try
             {
-                Thread.Sleep(3);
-                waited += 3;
+                if (wavPtr == IntPtr.Zero || size <= 44)
+                    throw new InvalidOperationException("AquesTalkã®éŸ³å£°ç”Ÿæˆã«å¤±æ•—ã—ã¾ã—ãŸã€‚éŸ³å£°è¨˜å·åˆ—ã‚’ç¢ºèªã—ã¦ãã ã•ã„ã€‚");
+                byte[] wavData = new byte[size];
+                Marshal.Copy(wavPtr, wavData, 0, size);
+                File.WriteAllBytes(filename, wavData);
             }
-
-            if (Pub.TalkTaskCount > 0)
-                throw new TimeoutException("Talk task did not complete within the expected time.");
+            finally
+            {
+                if (wavPtr != IntPtr.Zero) voiceObj.FreeWavData(wavPtr);
+            }
         }
-
-        #endregion
-
-        #region ¡İ’èƒNƒ‰ƒX
 
         public class Settings_HTTPAPICreateWav : SettingsBase
         {
             public int Port { get; set; } = 50088;
-
+            public string Password { get; set; } = string.Empty;
             internal Plugin_HTTPAPICreateWav Plugin;
-
             public Settings_HTTPAPICreateWav() { }
-
-            public Settings_HTTPAPICreateWav(Plugin_HTTPAPICreateWav plugin)
-            {
-                Plugin = plugin;
-            }
-
+            public Settings_HTTPAPICreateWav(Plugin_HTTPAPICreateWav plugin) { Plugin = plugin; }
             public override void ReadSettings() { }
-
             public override void WriteSettings() { }
         }
 
         public class SettingFormData_HTTPAPICreateWav : ISettingFormData
         {
             Settings_HTTPAPICreateWav _Setting;
-
             public string Title { get { return _Setting.Plugin.Name; } }
             public bool ExpandAll { get { return false; } }
             public SettingsBase Setting { get { return _Setting; } }
-
             public SettingFormData_HTTPAPICreateWav(Settings_HTTPAPICreateWav setting)
             {
                 _Setting = setting;
                 PBase = new SBase(_Setting);
             }
-
             public SBase PBase;
             public class SBase : ISettingPropertyGrid
             {
                 Settings_HTTPAPICreateWav _Setting;
                 public SBase(Settings_HTTPAPICreateWav setting) { _Setting = setting; }
-                public string GetName() { return "HTTPİ’è"; }
-
-                [Category("Šî–{İ’è")]
-                [DisplayName("ƒ|[ƒg‚ğ•ÏX‚·‚é")]
-                [Description("g—p‚·‚éƒ|[ƒg‚ğ•ÏX‚µ‚Ü‚·")]
+                public string GetName() { return "HTTPè¨­å®š"; }
+                [Category("åŸºæœ¬è¨­å®š")]
+                [DisplayName("ãƒãƒ¼ãƒˆã‚’å¤‰æ›´ã™ã‚‹")]
+                [Description("ä½¿ç”¨ã™ã‚‹ãƒãƒ¼ãƒˆã‚’å¤‰æ›´ã—ã¾ã™ï¼ˆå†èµ·å‹•å¾Œã«åæ˜ ï¼‰")]
                 public int Port { get { return _Setting.Port; } set { _Setting.Port = value; } }
+                [Category("åŸºæœ¬è¨­å®š")]
+                [DisplayName("APIãƒ‘ã‚¹ãƒ¯ãƒ¼ãƒ‰")]
+                [Description("ç©ºãªã‚‰èªè¨¼ãªã—ã€‚X-API-Passwordãƒ˜ãƒƒãƒ€ãƒ¼ã¾ãŸã¯passwordã‚¯ã‚¨ãƒªã§é€ä¿¡ã—ã¾ã™ã€‚è¨­å®šãƒ•ã‚¡ã‚¤ãƒ«ã«ã¯å¹³æ–‡ä¿å­˜ã•ã‚Œã¾ã™ã€‚")]
+                [PasswordPropertyText(true)]
+                public string Password { get { return _Setting.Password; } set { _Setting.Password = value ?? string.Empty; } }
             }
         }
-
-        #endregion
     }
 }
